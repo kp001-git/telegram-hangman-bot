@@ -241,6 +241,24 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------------------------
 # Main Execution
 # -------------------------------------------------------------------
+
+import threading
+from flask import Flask
+
+# Dummy HTTP server to satisfy Render's free Web Service requirement
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "Hangman Bot is Alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# Run Flask server in background thread
+threading.Thread(target=run_flask, daemon=True).start()
+
 if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("BOT_TOKEN is missing! Please check your .env file.")

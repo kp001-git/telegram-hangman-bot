@@ -1,45 +1,62 @@
 import os
-import sqlite3
 import random
 import logging
-from datetime import datetime
+import requests
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
-# Load variables from .env file
+# -------------------------------------------------------------------
+# Logging & Environment Setup
+# -------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 load_dotenv()
-
 TOKEN = os.getenv("BOT_TOKEN")
-
-# Word Bank (Only words longer than 5 letters)
-WORD_LIST = [
-    "BREAKFAST", "MAGNETIC", "DEVELOPER", "CHESSBOARD", "ALGORITHM",
-    "PYTHONIC", "DATABASE", "TELEGRAM", "KEYBOARD", "SOFTWARE",
-    "AUTOMATION", "COMMUNITY", "LIBRARIES", "REPOSITORY"
-]
-
-# Database Setup
-def init_db():
-    conn = sqlite3.connect("hangman.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS wins (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    username TEXT,
-                    chat_id INTEGER,
-                    timestamp DATETIME
-                )''')
-    conn.commit()
-    conn.close()
-
-init_db()
 
 # Active game state storage: {chat_id: game_dict}
 active_games = {}
 
+# -------------------------------------------------------------------
+# Helper Functions & Dynamic Word Fetcher
+# -------------------------------------------------------------------
+def fetch_random_word(min_length=6, max_length=10):
+    try:
+        start_char = random.choice("abcdefghijklmnopqrstuvwxyz")
+        url = f"https://api.datamuse.com/words?sp={start_char}{'?' * (min_length - 1)}*&max=100"
+        
+        response = requests.get(url, timeout=5)
+
+        if response.status_code == 200:
+            words = response.json()
+            valid_words = [
+                w["word"].upper()
+                for w in words
+                if w["word"].isalpha() and min_length <= len(w["word"]) <= max_length
+            ]
+            if valid_words:
+                return random.choice(valid_words)
+    except Exception as e:
+        logging.error(f"Failed to fetch dynamic word from API: {e}")
+
+    backup_words = [
+        "BREAKFAST", "MAGNETIC", "DEVELOPER", "CHESSBOARD",
+        "ALGORITHM", "PYTHONIC", "DATABASE", "TELEGRAM",
+        "KEYBOARD", "SOFTWARE", "AUTOMATION", "COMMUNITY",
+        "INTERFACE", "NETWORK", "SECURITY", "GAMING"
+    ]
+    return random.choice(backup_words)
+
+
 def get_keyboard(guessed_letters):
-    """Generates a 4x7 interactive inline keyboard A-Z."""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     keyboard = []
     row = []
@@ -55,31 +72,105 @@ def get_keyboard(guessed_letters):
         keyboard.append(row)
     return InlineKeyboardMarkup(keyboard)
 
+
 def render_word(word, guessed_letters):
-    """Renders concealed word like 'B R E A K F A S T' or '■ ■ ■ ■ ■'."""
     return " ".join([char if char in guessed_letters else "■" for char in word])
 
+# -------------------------------------------------------------------
+# Auto-Expiration System (10-Min Inactivity Timeout)
+# -------------------------------------------------------------------
+async def send_timeout_warning(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    if chat_id in active_games:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ Game will end in 2 minutes due to inactivity!",
+            parse_mode="HTML"
+        )
+
+async def expire_game(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    if chat_id in active_games:
+        word = active_games[chat_id]["word"]
+        del active_games[chat_id]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ Time's up! The word was <b>{word}</b>.\n\nUse /hangman to play again.",
+            parse_mode="HTML"
+        )
+
+def reset_game_timer(job_queue, chat_id):
+    clear_game_timer(job_queue, chat_id)
+
+    job_queue.run_once(
+        send_timeout_warning,
+        when=480,
+        chat_id=chat_id,
+        name=f"warn_{chat_id}"
+    )
+    job_queue.run_once(
+        expire_game,
+        when=600,
+        chat_id=chat_id,
+        name=f"expire_{chat_id}"
+    )
+
+def clear_game_timer(job_queue, chat_id):
+    for job_name in [f"warn_{chat_id}", f"expire_{chat_id}"]:
+        current_jobs = job_queue.get_jobs_by_name(job_name)
+        for job in current_jobs:
+            job.schedule_removal()
+
+# -------------------------------------------------------------------
+# Command & Callback Handlers
+# -------------------------------------------------------------------
 async def start_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # Check for game in progress
     if chat_id in active_games:
-        await update.message.reply_text("⚠️ A game is already in progress in this chat! Finish it before starting a new one.")
+        await update.message.reply_text(
+            "A game is already in progress! Use /endhangman to stop it first."
+        )
         return
 
-    word = random.choice(WORD_LIST)
+    word = fetch_random_word(min_length=6, max_length=10)
+
     active_games[chat_id] = {
         "word": word,
         "guessed": set(),
         "wrong": [],
-        "lives": 7
+        "lives": 7,
     }
+
+    reset_game_timer(context.job_queue, chat_id)
 
     game = active_games[chat_id]
     display = render_word(game["word"], game["guessed"])
+
+    text = f"🔤 <b>Hangman</b>\n\n<code>{display}</code>\n\n❤️ {game['lives']} lives left"
+    await update.message.reply_text(
+        text, reply_markup=get_keyboard(game["guessed"]), parse_mode="HTML"
+    )
+
+
+async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if chat_id not in active_games:
+        await update.message.reply_text("No game is currently in progress.")
+        return
+
+    word = active_games[chat_id]["word"]
     
-    text = f"🟢 **Hangman Game Started!**\n\n{display}\n\n❤️ {game['lives']} lives left"
-    await update.message.reply_text(text, reply_markup=get_keyboard(game["guessed"]), parse_mode="Markdown")
+    clear_game_timer(context.job_queue, chat_id)
+    del active_games[chat_id]
+
+    await update.message.reply_text(
+        f"💀 Game ended by <b>{user.first_name}</b>. The word was <b>{word}</b>.\n\nUse /hangman to start a new game.",
+        parse_mode="HTML"
+    )
+
 
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -92,8 +183,12 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
 
     if chat_id not in active_games:
-        await query.edit_message_text("No active game found. Use /hangman to start a new game!")
+        await query.edit_message_text(
+            "No active game found. Use /hangman to start a new game!"
+        )
         return
+
+    reset_game_timer(context.job_queue, chat_id)
 
     game = active_games[chat_id]
     letter = query.data.split("_")[1]
@@ -112,64 +207,49 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Win Condition
     if set(game["word"]).issubset(game["guessed"]):
-        record_win(user.id, user.first_name, chat_id)
+        clear_game_timer(context.job_queue, chat_id)
         del active_games[chat_id]
-        await query.edit_message_text(f"🎯 **{user.first_name}** solved it — the word was **{game['word']}**!\n\nUse /hangman to play again.")
+        
+        await query.edit_message_text(
+            f"🎯 <b>{user.first_name}</b> solved it — the word was <b>{game['word']}</b>!\n\n/hangman for a rematch",
+            parse_mode="HTML"
+        )
         return
 
     # Loss Condition
     if game["lives"] <= 0:
+        clear_game_timer(context.job_queue, chat_id)
         target_word = game["word"]
         del active_games[chat_id]
-        await query.edit_message_text(f"💀 Out of lives! The word was **{target_word}**.\n\nUse /hangman to try again.")
+        
+        await query.edit_message_text(
+            f"💀 Out of lives! The word was <b>{target_word}</b>.\n\n/hangman for a rematch",
+            parse_mode="HTML"
+        )
         return
 
-    # Game state update
-    text = f"🟢 **Hangman**\n\n{word_display}\n\n❤️ {game['lives']} lives left\n✖️ Wrong: {wrong_str}"
-    await query.edit_message_text(text, reply_markup=get_keyboard(game["guessed"].union(set(game["wrong"]))), parse_mode="Markdown")
+    # Active play state
+    text = (
+        f"🔤 <b>Hangman</b>\n\n<code>{word_display}</code>\n\n❤️ {game['lives']} lives left\n✖️ Wrong: {wrong_str}"
+    )
+    await query.edit_message_text(
+        text,
+        reply_markup=get_keyboard(game["guessed"].union(set(game["wrong"]))),
+        parse_mode="HTML",
+    )
 
-def record_win(user_id, username, chat_id):
-    conn = sqlite3.connect("hangman.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO wins (user_id, username, chat_id, timestamp) VALUES (?, ?, ?, ?)",
-              (user_id, username, chat_id, datetime.utcnow()))
-    conn.commit()
-    conn.close()
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = context.args
-    scope = args[0].lower() if args else "chat"
-
-    conn = sqlite3.connect("hangman.db")
-    c = conn.cursor()
-
-    if scope == "global":
-        c.execute("SELECT username, COUNT(*) as score FROM wins GROUP BY user_id ORDER BY score DESC LIMIT 10")
-        title = "🏆 **Global Leaderboard**"
-    else:
-        c.execute("SELECT username, COUNT(*) as score FROM wins WHERE chat_id = ? GROUP BY user_id ORDER BY score DESC LIMIT 10", (chat_id,))
-        title = "🏆 **Group Leaderboard**"
-
-    rows = c.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text("No wins recorded yet!")
-        return
-
-    text = f"{title}\n\n"
-    for idx, (username, score) in enumerate(rows, start=1):
-        text += f"{idx}. {username} — {score} wins\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
+# -------------------------------------------------------------------
+# Main Execution
+# -------------------------------------------------------------------
 if __name__ == "__main__":
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN is missing! Please check your .env file.")
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("hangman", start_hangman))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("endhangman", end_hangman))
     app.add_handler(CallbackQueryHandler(handle_guess, pattern="^guess_"))
 
-    print("Bot running...")
+    print("Bot is up and running...")
     app.run_polling()

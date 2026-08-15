@@ -1,7 +1,9 @@
 import os
 import random
 import logging
+import threading
 import requests
+from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,6 +23,19 @@ logging.basicConfig(
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+
+# Dummy Flask server for Render free web service uptime
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def health_check():
+    return "Hangman Bot is Alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_flask, daemon=True).start()
 
 # Active game state storage: {chat_id: game_dict}
 active_games = {}
@@ -148,9 +163,10 @@ async def start_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display = render_word(game["word"], game["guessed"])
 
     text = f"🔤 <b>Hangman</b>\n\n<code>{display}</code>\n\n❤️ {game['lives']} lives left"
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         text, reply_markup=get_keyboard(game["guessed"]), parse_mode="HTML"
     )
+    active_games[chat_id]["message_id"] = msg.message_id
 
 
 async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,9 +178,17 @@ async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     word = active_games[chat_id]["word"]
+    last_msg_id = active_games[chat_id].get("message_id")
     
     clear_game_timer(context.job_queue, chat_id)
     del active_games[chat_id]
+
+    # Remove keyboard from last game board if reachable
+    if last_msg_id:
+        try:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=last_msg_id, reply_markup=None)
+        except Exception:
+            pass
 
     await update.message.reply_text(
         f"💀 Game ended by <b>{user.first_name}</b>. The word was <b>{word}</b>.\n\nUse /hangman to start a new game.",
@@ -174,20 +198,25 @@ async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if query.data == "ignore":
+        await query.answer()
         return
 
     chat_id = query.message.chat_id
     user = query.from_user
 
+    # If no active game, show a personal pop-up alert instead of breaking the chat
     if chat_id not in active_games:
-        await query.edit_message_text(
-            "No active game found. Use /hangman to start a new game!"
-        )
+        await query.answer("⚠️ No active game. Use /hangman to start a new one!", show_alert=True)
+        # Clean up the dead keyboard so it stops getting clicked
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
+    await query.answer()
     reset_game_timer(context.job_queue, chat_id)
 
     game = active_games[chat_id]
@@ -212,6 +241,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"🎯 <b>{user.first_name}</b> solved it — the word was <b>{game['word']}</b>!\n\n/hangman for a rematch",
+            reply_markup=None,
             parse_mode="HTML"
         )
         return
@@ -224,11 +254,12 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"💀 Out of lives! The word was <b>{target_word}</b>.\n\n/hangman for a rematch",
+            reply_markup=None,
             parse_mode="HTML"
         )
         return
 
-    # Active play state
+    # Normal state update
     text = (
         f"🔤 <b>Hangman</b>\n\n<code>{word_display}</code>\n\n❤️ {game['lives']} lives left\n✖️ Wrong: {wrong_str}"
     )
@@ -241,24 +272,6 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------------------------
 # Main Execution
 # -------------------------------------------------------------------
-
-import threading
-from flask import Flask
-
-# Dummy HTTP server to satisfy Render's free Web Service requirement
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def health_check():
-    return "Hangman Bot is Alive!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
-
-# Run Flask server in background thread
-threading.Thread(target=run_flask, daemon=True).start()
-
 if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("BOT_TOKEN is missing! Please check your .env file.")

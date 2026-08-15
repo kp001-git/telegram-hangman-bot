@@ -40,36 +40,75 @@ threading.Thread(target=run_flask, daemon=True).start()
 # Active game state storage: {chat_id: game_dict}
 active_games = {}
 
+# Fallback word bank with definitions and synonyms
+BACKUP_WORDS = [
+    ("BREAKFAST", "The first meal of the day, usually eaten in the morning.", ["morning meal", "brunch"]),
+    ("MAGNETIC", "Capable of attracting iron objects or having great charisma.", ["attractive", "alluring", "compelling"]),
+    ("DEVELOPER", "A person or entity that creates computer software.", ["programmer", "coder", "engineer"]),
+    ("CHESSBOARD", "A square checkered board divided into 64 squares for playing chess.", ["gameboard"]),
+    ("ALGORITHM", "A precise step-by-step procedure for solving a computational problem.", ["procedure", "formula", "logic"]),
+    ("DATABASE", "A structured collection of electronic data stored in a computer system.", ["data store", "repository"]),
+    ("TELEGRAM", "A cloud-based instant messaging and broadcasting service.", ["message", "dispatch"]),
+    ("KEYBOARD", "A set of input keys on a computer or musical instrument.", ["keypad", "terminal"]),
+    ("AUTOMATION", "The use of automatic control systems to operate equipment or software.", ["mechanization", "robotics"])
+]
+
 # -------------------------------------------------------------------
-# Helper Functions & Dynamic Word Fetcher
+# Helper Functions & Word Fetcher
 # -------------------------------------------------------------------
+def fetch_synonyms(word):
+    """Fetches up to 3 common synonyms for the target word."""
+    try:
+        url = f"https://api.datamuse.com/words?rel_syn={word.lower()}&max=3"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            syns = [w.get("word") for w in response.json() if w.get("word")]
+            return syns
+    except Exception as e:
+        logging.error(f"Failed to fetch synonyms: {e}")
+    return []
+
 def fetch_random_word(min_length=6, max_length=10):
+    """
+    Fetches a random word along with its definition and synonyms.
+    """
     try:
         start_char = random.choice("abcdefghijklmnopqrstuvwxyz")
-        url = f"https://api.datamuse.com/words?sp={start_char}{'?' * (min_length - 1)}*&max=100"
+        url = f"https://api.datamuse.com/words?sp={start_char}{'?' * (min_length - 1)}*&md=d&max=100"
         
         response = requests.get(url, timeout=5)
 
         if response.status_code == 200:
             words = response.json()
-            valid_words = [
-                w["word"].upper()
-                for w in words
-                if w["word"].isalpha() and min_length <= len(w["word"]) <= max_length
-            ]
-            if valid_words:
-                return random.choice(valid_words)
+            valid_items = []
+            for w in words:
+                word_text = w.get("word", "")
+                defs = w.get("defs", [])
+                if word_text.isalpha() and min_length <= len(word_text) <= max_length:
+                    clean_def = ""
+                    if defs:
+                        first_def = defs[0]
+                        clean_def = first_def.split("\t")[-1].strip().capitalize()
+                    valid_items.append((word_text.upper(), clean_def))
+
+            if valid_items:
+                chosen_word, chosen_def = random.choice(valid_items)
+                synonyms = fetch_synonyms(chosen_word)
+                return chosen_word, chosen_def, synonyms
     except Exception as e:
-        logging.error(f"Failed to fetch dynamic word from API: {e}")
+        logging.error(f"Failed to fetch dynamic word details: {e}")
 
-    backup_words = [
-        "BREAKFAST", "MAGNETIC", "DEVELOPER", "CHESSBOARD",
-        "ALGORITHM", "PYTHONIC", "DATABASE", "TELEGRAM",
-        "KEYBOARD", "SOFTWARE", "AUTOMATION", "COMMUNITY",
-        "INTERFACE", "NETWORK", "SECURITY", "GAMING"
-    ]
-    return random.choice(backup_words)
+    return random.choice(BACKUP_WORDS)
 
+def format_word_details(definition, synonyms):
+    """Helper to format definition and synonyms block cleanly."""
+    details = ""
+    if definition:
+        details += f"\n\n📖 <i>{definition}</i>"
+    if synonyms:
+        syn_str = ", ".join(synonyms)
+        details += f"\n🔗 <b>Synonyms:</b> {syn_str}"
+    return details
 
 def get_keyboard(guessed_letters):
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -86,7 +125,6 @@ def get_keyboard(guessed_letters):
     if row:
         keyboard.append(row)
     return InlineKeyboardMarkup(keyboard)
-
 
 def render_word(word, guessed_letters):
     return " ".join([char if char in guessed_letters else "■" for char in word])
@@ -107,10 +145,14 @@ async def expire_game(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     if chat_id in active_games:
         word = active_games[chat_id]["word"]
+        definition = active_games[chat_id]["definition"]
+        synonyms = active_games[chat_id]["synonyms"]
         del active_games[chat_id]
+
+        info_block = format_word_details(definition, synonyms)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⏳ Time's up! The word was <b>{word}</b>.\n\nUse /hangman to play again.",
+            text=f"⏳ Time's up! The word was <b>{word}</b>.{info_block}\n\nUse /hangman to play again.",
             parse_mode="HTML"
         )
 
@@ -148,10 +190,12 @@ async def start_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    word = fetch_random_word(min_length=6, max_length=10)
+    word, definition, synonyms = fetch_random_word(min_length=6, max_length=10)
 
     active_games[chat_id] = {
         "word": word,
+        "definition": definition,
+        "synonyms": synonyms,
         "guessed": set(),
         "wrong": [],
         "lives": 7,
@@ -168,7 +212,6 @@ async def start_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     active_games[chat_id]["message_id"] = msg.message_id
 
-
 async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -178,23 +221,24 @@ async def end_hangman(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     word = active_games[chat_id]["word"]
+    definition = active_games[chat_id]["definition"]
+    synonyms = active_games[chat_id]["synonyms"]
     last_msg_id = active_games[chat_id].get("message_id")
     
     clear_game_timer(context.job_queue, chat_id)
     del active_games[chat_id]
 
-    # Remove keyboard from last game board if reachable
     if last_msg_id:
         try:
             await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=last_msg_id, reply_markup=None)
         except Exception:
             pass
 
+    info_block = format_word_details(definition, synonyms)
     await update.message.reply_text(
-        f"💀 Game ended by <b>{user.first_name}</b>. The word was <b>{word}</b>.\n\nUse /hangman to start a new game.",
+        f"💀 Game ended by <b>{user.first_name}</b>. The word was <b>{word}</b>.{info_block}\n\nUse /hangman to start a new game.",
         parse_mode="HTML"
     )
-
 
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -206,10 +250,8 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     user = query.from_user
 
-    # If no active game, show a personal pop-up alert instead of breaking the chat
     if chat_id not in active_games:
         await query.answer("⚠️ No active game. Use /hangman to start a new one!", show_alert=True)
-        # Clean up the dead keyboard so it stops getting clicked
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -237,10 +279,14 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Win Condition
     if set(game["word"]).issubset(game["guessed"]):
         clear_game_timer(context.job_queue, chat_id)
+        word = game["word"]
+        definition = game["definition"]
+        synonyms = game["synonyms"]
         del active_games[chat_id]
         
+        info_block = format_word_details(definition, synonyms)
         await query.edit_message_text(
-            f"🎯 <b>{user.first_name}</b> solved it — the word was <b>{game['word']}</b>!\n\n/hangman for a rematch",
+            f"🎯 <b>{user.first_name}</b> solved it — the word was <b>{word}</b>!{info_block}\n\n/hangman for a rematch",
             reply_markup=None,
             parse_mode="HTML"
         )
@@ -250,10 +296,13 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if game["lives"] <= 0:
         clear_game_timer(context.job_queue, chat_id)
         target_word = game["word"]
+        definition = game["definition"]
+        synonyms = game["synonyms"]
         del active_games[chat_id]
         
+        info_block = format_word_details(definition, synonyms)
         await query.edit_message_text(
-            f"💀 Out of lives! The word was <b>{target_word}</b>.\n\n/hangman for a rematch",
+            f"💀 Out of lives! The word was <b>{target_word}</b>.{info_block}\n\n/hangman for a rematch",
             reply_markup=None,
             parse_mode="HTML"
         )
